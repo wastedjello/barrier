@@ -8,6 +8,7 @@ import serial
 import time
 import os
 from datetime import datetime
+import warnings
 
 # ================= CONFIG =================
 WIDTH, HEIGHT = 640, 480
@@ -19,16 +20,24 @@ PHOTO_DIR = "photos"
 SERIAL_PORT = "/dev/ttyACM0"   # change if needed
 BAUD = 9600
 
-SAMPLE_RATE = 5
-DEDUP_SECONDS = 5
+SAMPLE_RATE = 3        # OCR every 3 frames (faster detection)
+DEDUP_SECONDS = 5      # avoid duplicate logging
 # ==========================================
 
+# Suppress annoying libpng warnings
+warnings.filterwarnings("ignore", message=".*iCCP.*")
+
+# Create photos folder if missing
 os.makedirs(PHOTO_DIR, exist_ok=True)
 
 # ---------- Arduino ----------
-ser = serial.Serial(SERIAL_PORT, BAUD, timeout=1)
-time.sleep(2)
-print("🔌 Arduino connected")
+try:
+    ser = serial.Serial(SERIAL_PORT, BAUD, timeout=1)
+    time.sleep(2)
+    print(f"🔌 Arduino connected on {SERIAL_PORT}")
+except Exception as e:
+    print(f"⚠️ Arduino not connected: {e}")
+    ser = None
 
 # ---------- Plate helpers ----------
 def clean_plate_text(text):
@@ -37,6 +46,7 @@ def clean_plate_text(text):
     return text
 
 def valid_plate(text):
+    # Only accept likely plates
     return (
         6 <= len(text) <= 10 and
         any(c.isdigit() for c in text) and
@@ -44,14 +54,24 @@ def valid_plate(text):
     )
 
 def detect_plate_and_ocr(frame):
+    # Convert to gray and denoise
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
     gray = cv2.bilateralFilter(gray, 11, 17, 17)
-    edged = cv2.Canny(gray, 50, 200)
 
+    # Adaptive threshold for screen reading
+    thresh = cv2.adaptiveThreshold(
+        gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv2.THRESH_BINARY, 11, 2
+    )
+
+    # Edge detection
+    edged = cv2.Canny(thresh, 30, 200)
+
+    # Contours
     contours, _ = cv2.findContours(
         edged, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE
     )
-    contours = sorted(contours, key=cv2.contourArea, reverse=True)[:15]
+    contours = sorted(contours, key=cv2.contourArea, reverse=True)[:20]
 
     for c in contours:
         peri = cv2.arcLength(c, True)
@@ -65,11 +85,18 @@ def detect_plate_and_ocr(frame):
             plate = frame[y:y+h, x:x+w]
             plate_gray = cv2.cvtColor(plate, cv2.COLOR_BGR2GRAY)
 
-            text = pytesseract.image_to_string(
-                plate_gray,
-                config="--psm 7 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+            # Threshold for OCR
+            plate_thresh = cv2.adaptiveThreshold(
+                plate_gray, 255,
+                cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                cv2.THRESH_BINARY, 11, 2
             )
 
+            # OCR
+            text = pytesseract.image_to_string(
+                plate_thresh,
+                config="--psm 7 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+            )
             text = clean_plate_text(text)
             if valid_plate(text):
                 return text, (x, y, w, h)
@@ -82,7 +109,7 @@ cmd = [
     "--codec", "yuv420",
     "--inline",
     "--nopreview",
-    "--timeout", "0", 
+    "--timeout", "0",
     "--width", str(WIDTH),
     "--height", str(HEIGHT),
     "--framerate", str(FPS),
@@ -113,7 +140,8 @@ while True:
     yuv = np.frombuffer(raw, dtype=np.uint8).reshape((HEIGHT * 3 // 2, WIDTH))
     frame = cv2.cvtColor(yuv, cv2.COLOR_YUV2BGR_I420)
 
-    # detect
+    bbox = None
+
     if frame_idx % SAMPLE_RATE == 0:
         plate_text, bbox = detect_plate_and_ocr(frame)
         now = time.time()
@@ -125,30 +153,31 @@ while True:
 
                 ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                 fname = f"{PHOTO_DIR}/{plate_text}_{int(now)}.jpg"
-
                 cv2.imwrite(fname, frame)
+
                 records.append({
                     "timestamp": ts,
                     "plate": plate_text,
                     "image": fname
                 })
 
-                # 🖨 Terminal notification
-                print(f"📸 PHOTO TAKEN | Plate: {plate_text}")
+                # Terminal notification
+                print(f"📸 PHOTO TAKEN | Plate: {plate_text} | Saved as: {fname}")
 
-                # 🖥 On-screen notification (2 seconds)
+                # On-screen notification
                 flash_text = f"PHOTO SAVED: {plate_text}"
                 flash_until = time.time() + 2
 
-                # 🚦 Arduino trigger
-                ser.write(b"TRIGGER\n")
+                # Arduino trigger
+                if ser:
+                    ser.write(b"TRIGGER\n")
 
     # Draw bounding box
     if bbox:
         x, y, w, h = bbox
-        cv2.rectangle(frame, (x,y), (x+w, y+h), (0,255,0), 2)
+        cv2.rectangle(frame, (x, y), (x+w, y+h), (0, 255, 0), 2)
 
-    # Show notification
+    # Flash notification
     if time.time() < flash_until:
         cv2.putText(
             frame,
@@ -168,10 +197,10 @@ while True:
 
 # ---------- Cleanup ----------
 proc.terminate()
-ser.close()
+if ser:
+    ser.close()
 cv2.destroyAllWindows()
 
 df = pd.DataFrame(records)
 df.to_csv(CSV_FILE, index=False)
-
 print(f"📄 Saved {len(df)} entries to {CSV_FILE}")
