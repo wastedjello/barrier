@@ -26,3 +26,10 @@ A Raspberry Pi–based Automatic Number Plate Recognition (ANPR) system using:
 - Tesseract OCR
 - Picamera2
 - Pandas
+
+# How to Run
+- Connect required peripherals to Raspberry Pi 5
+- SSH to Raspberry Pi
+- Activate required VENV with required Python modules
+- Navigate to folder
+- Run 'mobile_test.py'
